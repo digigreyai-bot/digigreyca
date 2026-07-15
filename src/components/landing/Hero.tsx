@@ -31,7 +31,7 @@ export function Hero() {
 
       <div className="relative mx-auto max-w-7xl px-4 sm:px-6">
         <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.6 }}>
-          <SectionBadge>Canadian-registered · Delivery in Pakistan · Global markets</SectionBadge>
+          <SectionBadge>Catering all global markets</SectionBadge>
         </motion.div>
 
         <motion.h1

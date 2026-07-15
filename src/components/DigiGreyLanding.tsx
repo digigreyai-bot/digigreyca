@@ -1,6 +1,5 @@
 import { Nav } from "./landing/Nav";
 import { Hero } from "./landing/Hero";
-import { Trust } from "./landing/Trust";
 import { About } from "./landing/About";
 import { Services } from "./landing/Services";
 import { Industries } from "./landing/Industries";
@@ -20,7 +19,6 @@ export default function DigiGreyLanding() {
     <main className="bg-background text-foreground overflow-x-hidden">
       <Nav />
       <Hero />
-      <Trust />
       <About />
       <Services />
       <Industries />
