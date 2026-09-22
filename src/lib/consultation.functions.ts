@@ -1,6 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { createClient } from "@supabase/supabase-js";
-import nodemailer from "nodemailer";
+import { connect as tlsConnect } from "node:tls";
 import { z } from "zod";
 import type { Database } from "@/integrations/supabase/types";
 
@@ -66,6 +66,7 @@ async function tryPersistToSupabase(data: z.infer<typeof schema>): Promise<boole
   }
 }
 
+/** Minimal Gmail SMTP (AUTH LOGIN over TLS) — no extra dependency for Railway/bun. */
 async function sendViaGmail(opts: {
   to: string;
   from: string;
@@ -76,19 +77,132 @@ async function sendViaGmail(opts: {
   const pass = process.env.APP_PASSWORD?.replace(/\s+/g, "");
   if (!user || !pass) return false;
 
-  const transporter = nodemailer.createTransport({
-    service: "gmail",
-    auth: { user, pass },
-  });
+  const fromHeader = opts.from.includes("<") ? opts.from : `DigiGrey Website <${user}>`;
+  const message = [
+    `From: ${fromHeader}`,
+    `To: ${opts.to}`,
+    `Reply-To: ${opts.replyTo}`,
+    `Subject: ${SUBJECT}`,
+    "MIME-Version: 1.0",
+    'Content-Type: text/html; charset="UTF-8"',
+    "",
+    opts.html,
+  ].join("\r\n");
 
-  await transporter.sendMail({
-    from: opts.from,
-    to: opts.to,
-    replyTo: opts.replyTo,
-    subject: SUBJECT,
-    html: opts.html,
+  await smtpSend({
+    host: "smtp.gmail.com",
+    port: 465,
+    user,
+    pass,
+    mailFrom: user,
+    rcptTo: opts.to,
+    data: message,
   });
   return true;
+}
+
+function smtpSend(opts: {
+  host: string;
+  port: number;
+  user: string;
+  pass: string;
+  mailFrom: string;
+  rcptTo: string;
+  data: string;
+}): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = tlsConnect(opts.port, opts.host, { servername: opts.host }, () => {
+      void run();
+    });
+
+    let buffer = "";
+    let settled = false;
+
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      reject(err);
+    };
+
+    const ok = () => {
+      if (settled) return;
+      settled = true;
+      socket.end();
+      resolve();
+    };
+
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+    });
+    socket.on("error", fail);
+    socket.on("timeout", () => fail(new Error("SMTP connection timed out")));
+    socket.setTimeout(20_000);
+
+    const readResponse = async (): Promise<{ code: number; lines: string }> => {
+      for (;;) {
+        const idx = buffer.indexOf("\r\n");
+        if (idx === -1) {
+          await new Promise<void>((r) => socket.once("data", () => r()));
+          continue;
+        }
+        // multiline: "250-..." then final "250 "
+        const lines: string[] = [];
+        while (buffer.includes("\r\n")) {
+          const end = buffer.indexOf("\r\n");
+          const line = buffer.slice(0, end);
+          buffer = buffer.slice(end + 2);
+          lines.push(line);
+          if (/^\d{3} /.test(line)) break;
+        }
+        if (!lines.length) continue;
+        const last = lines[lines.length - 1]!;
+        const code = Number(last.slice(0, 3));
+        return { code, lines: lines.join("\n") };
+      }
+    };
+
+    const write = (cmd: string) => {
+      socket.write(cmd + "\r\n");
+    };
+
+    const expect = async (min: number, max: number, step: string) => {
+      const res = await readResponse();
+      if (res.code < min || res.code > max) {
+        throw new Error(`SMTP ${step} failed (${res.code}): ${res.lines}`);
+      }
+      return res;
+    };
+
+    const run = async () => {
+      try {
+        await expect(200, 299, "banner");
+        write(`EHLO digigrey.ca`);
+        await expect(200, 299, "EHLO");
+        write("AUTH LOGIN");
+        await expect(300, 399, "AUTH LOGIN");
+        write(Buffer.from(opts.user).toString("base64"));
+        await expect(300, 399, "username");
+        write(Buffer.from(opts.pass).toString("base64"));
+        await expect(200, 299, "password");
+        write(`MAIL FROM:<${opts.mailFrom}>`);
+        await expect(200, 299, "MAIL FROM");
+        write(`RCPT TO:<${opts.rcptTo}>`);
+        await expect(200, 299, "RCPT TO");
+        write("DATA");
+        await expect(300, 399, "DATA");
+        // Dot-stuff lines that start with '.'
+        const stuffed = opts.data.replace(/^\./gm, "..");
+        socket.write(stuffed.replace(/\r?\n/g, "\r\n") + "\r\n.\r\n");
+        await expect(200, 299, "message body");
+        write("QUIT");
+        ok();
+      } catch (err) {
+        fail(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+  });
 }
 
 async function sendViaResend(opts: {
