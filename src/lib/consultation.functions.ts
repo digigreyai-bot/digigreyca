@@ -14,6 +14,7 @@ const schema = z.object({
 });
 
 const SUBJECT = "New Consultation Request — DigiGrey Website";
+const SITE_ORIGIN = "https://www.digigrey.ca";
 
 type Lead = z.infer<typeof schema>;
 
@@ -64,7 +65,7 @@ async function tryPersistToSupabase(data: Lead): Promise<boolean> {
   }
 }
 
-/** HTTPS webhook (Google Apps Script or Make.com) — works on Railway; SMTP does not. */
+/** Optional: Google Apps Script / Make.com HTTPS webhook */
 async function sendViaWebhook(data: Lead, to: string, html: string): Promise<boolean> {
   const url = process.env.CONSULTATION_WEBHOOK_URL;
   if (!url) return false;
@@ -92,19 +93,69 @@ async function sendViaWebhook(data: Lead, to: string, html: string): Promise<boo
 
     const text = await res.text();
     console.info("[consultation] webhook:", res.status, text.slice(0, 300));
-
     if (!res.ok) return false;
 
     try {
       const json = JSON.parse(text) as { ok?: boolean };
       if (json.ok === false) return false;
     } catch {
-      /* Make.com often returns empty/non-JSON — treat 2xx as success */
+      /* non-JSON 2xx = ok (Make.com) */
     }
     return true;
   } catch (err) {
     console.error("[consultation] webhook failed:", err);
     return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** FormSubmit HTTPS — activate once via the email in Spam, then leads arrive in Gmail */
+async function sendViaFormSubmit(data: Lead, to: string): Promise<"ok" | "activate" | "fail"> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+
+  try {
+    const res = await fetch(`https://formsubmit.co/ajax/${encodeURIComponent(to)}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Origin: SITE_ORIGIN,
+        Referer: `${SITE_ORIGIN}/`,
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        name: data.name,
+        email: data.email,
+        phone: data.phone || "—",
+        service: data.service,
+        message: data.message || "—",
+        _subject: SUBJECT,
+        _template: "table",
+        _replyto: data.email,
+        _captcha: "false",
+      }),
+    });
+
+    const body = (await res.json().catch(() => ({}))) as {
+      success?: string | boolean;
+      message?: string;
+      error?: string;
+    };
+    console.info("[consultation] FormSubmit:", res.status, body);
+
+    const text = `${body.message || ""} ${body.error || ""}`.toLowerCase();
+    if (text.includes("activation") || text.includes("activate form") || text.includes("activate")) {
+      return "activate";
+    }
+    if (!res.ok || body.error || body.success === false || body.success === "false") {
+      return "fail";
+    }
+    return body.success === true || body.success === "true" ? "ok" : "fail";
+  } catch (err) {
+    console.error("[consultation] FormSubmit failed:", err);
+    return "fail";
   } finally {
     clearTimeout(timer);
   }
@@ -188,12 +239,17 @@ export const submitConsultation = createServerFn({ method: "POST" })
       }
     }
 
-    if (!saved && !emailed) {
-      if (!process.env.CONSULTATION_WEBHOOK_URL && !process.env.RESEND_API_KEY) {
+    if (!emailed) {
+      const result = await sendViaFormSubmit(data, TO_EMAIL);
+      if (result === "activate") {
         throw new Error(
-          "Email not configured. Add CONSULTATION_WEBHOOK_URL on Railway (Google Apps Script — see scripts/consultation-mail.gs).",
+          `Spam folder mein FormSubmit "Activate Form" email kholo → link pe click → phir form dubara submit karo.`,
         );
       }
+      emailed = result === "ok";
+    }
+
+    if (!saved && !emailed) {
       throw new Error("We couldn't save your request. Please try again.");
     }
 
