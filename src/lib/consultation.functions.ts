@@ -14,6 +14,7 @@ const schema = z.object({
 });
 
 const SUBJECT = "New Consultation Request — DigiGrey Website";
+const SITE_ORIGIN = "https://www.digigrey.ca";
 
 type Lead = z.infer<typeof schema>;
 
@@ -65,8 +66,8 @@ async function tryPersistToSupabase(data: Lead): Promise<boolean> {
 }
 
 /**
- * Railway blocks outbound Gmail SMTP (ETIMEDOUT on :465/:587).
- * FormSubmit delivers over HTTPS to the inbox — first use needs one Confirm click in Gmail.
+ * Railway blocks Gmail SMTP. FormSubmit works over HTTPS once the inbox
+ * clicks the one-time "Activate Form" link.
  */
 async function sendViaFormSubmit(data: Lead, to: string): Promise<"ok" | "activate" | "fail"> {
   const controller = new AbortController();
@@ -78,6 +79,8 @@ async function sendViaFormSubmit(data: Lead, to: string): Promise<"ok" | "activa
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json",
+        Origin: SITE_ORIGIN,
+        Referer: `${SITE_ORIGIN}/`,
       },
       signal: controller.signal,
       body: JSON.stringify({
@@ -98,20 +101,18 @@ async function sendViaFormSubmit(data: Lead, to: string): Promise<"ok" | "activa
       message?: string;
       error?: string;
     };
-    const text = `${body.message || ""} ${body.error || ""} ${body.success || ""}`.toLowerCase();
+    console.info("[consultation] FormSubmit:", res.status, body);
 
-    if (!res.ok || body.error || text.includes("activate") || text.includes("confirm")) {
-      console.error("[consultation] FormSubmit response:", res.status, body);
-      if (text.includes("activate") || text.includes("confirm") || res.status === 200) {
-        // FormSubmit often returns 200 with activation instructions on first use
-        if (text.includes("activate") || text.includes("confirm") || text.includes("make sure")) {
-          return "activate";
-        }
-      }
-      if (!res.ok || body.error) return "fail";
+    const success = body.success === true || body.success === "true";
+    const text = `${body.message || ""} ${body.error || ""}`.toLowerCase();
+
+    if (text.includes("activation") || text.includes("activate form") || text.includes("activate")) {
+      return "activate";
     }
-
-    return "ok";
+    if (!res.ok || body.error || body.success === false || body.success === "false") {
+      return "fail";
+    }
+    return success ? "ok" : "fail";
   } catch (err) {
     console.error("[consultation] FormSubmit failed:", err);
     return "fail";
@@ -179,7 +180,6 @@ export const submitConsultation = createServerFn({ method: "POST" })
 
     let emailed = false;
 
-    // Prefer Resend (HTTPS) if configured
     try {
       emailed = await sendViaResend({
         to: TO_EMAIL,
@@ -191,12 +191,11 @@ export const submitConsultation = createServerFn({ method: "POST" })
       console.error("[consultation] Resend send failed:", err);
     }
 
-    // Fallback: FormSubmit HTTPS → GMAIL inbox (SMTP blocked on Railway)
     if (!emailed) {
       const result = await sendViaFormSubmit(data, TO_EMAIL);
       if (result === "activate") {
         throw new Error(
-          `Check ${TO_EMAIL} for a FormSubmit activation email, click Confirm, then submit again.`,
+          `Open ${TO_EMAIL} → find FormSubmit "Activate Form" email → click the link → then submit again.`,
         );
       }
       emailed = result === "ok";
