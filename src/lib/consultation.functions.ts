@@ -1,5 +1,4 @@
 import { createServerFn } from "@tanstack/react-start";
-import { getRequest } from "@tanstack/react-start/server";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import type { Database } from "@/integrations/supabase/types";
@@ -15,34 +14,6 @@ const schema = z.object({
 });
 
 const SUBJECT = "New Consultation Request — DigiGrey Website";
-const RATE_WINDOW_MS = 15 * 60 * 1000;
-const RATE_MAX = 5;
-
-/** In-memory rate limit (per server instance). Fine for single-node / low traffic. */
-const rateHits = new Map<string, { count: number; resetAt: number }>();
-
-function clientIp(): string {
-  try {
-    const req = getRequest();
-    const forwarded = req.headers.get("x-forwarded-for");
-    if (forwarded) return forwarded.split(",")[0]?.trim() || "unknown";
-    return req.headers.get("x-real-ip") || "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
-function allowRequest(ip: string): boolean {
-  const now = Date.now();
-  const entry = rateHits.get(ip);
-  if (!entry || now > entry.resetAt) {
-    rateHits.set(ip, { count: 1, resetAt: now + RATE_WINDOW_MS });
-    return true;
-  }
-  if (entry.count >= RATE_MAX) return false;
-  entry.count += 1;
-  return true;
-}
 
 export const submitConsultation = createServerFn({ method: "POST" })
   .validator((input: unknown) => schema.parse(input))
@@ -50,11 +21,6 @@ export const submitConsultation = createServerFn({ method: "POST" })
     // Bot sink: pretend success, do not persist or email
     if (data.website && data.website.trim().length > 0) {
       return { ok: true, emailed: false };
-    }
-
-    const ip = clientIp();
-    if (!allowRequest(ip)) {
-      throw new Error("Too many requests. Please try again in a few minutes.");
     }
 
     const SUPABASE_URL = process.env.SUPABASE_URL!;
