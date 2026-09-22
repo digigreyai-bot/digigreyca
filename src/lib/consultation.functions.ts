@@ -1,6 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
 import { createClient } from "@supabase/supabase-js";
-import { connect as tlsConnect } from "node:tls";
 import { z } from "zod";
 import type { Database } from "@/integrations/supabase/types";
 
@@ -16,7 +15,9 @@ const schema = z.object({
 
 const SUBJECT = "New Consultation Request — DigiGrey Website";
 
-function buildHtml(data: z.infer<typeof schema>): string {
+type Lead = z.infer<typeof schema>;
+
+function buildHtml(data: Lead): string {
   return `
       <div style="font-family:Manrope,Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#1a1a1a">
         <h2 style="color:#4A0E6E;margin:0 0 16px">New Consultation Request</h2>
@@ -32,13 +33,10 @@ function buildHtml(data: z.infer<typeof schema>): string {
     `;
 }
 
-async function tryPersistToSupabase(data: z.infer<typeof schema>): Promise<boolean> {
+async function tryPersistToSupabase(data: Lead): Promise<boolean> {
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
-  if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
-    console.warn("[consultation] Supabase env not set — skipping DB save.");
-    return false;
-  }
+  if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) return false;
 
   try {
     const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
@@ -56,7 +54,7 @@ async function tryPersistToSupabase(data: z.infer<typeof schema>): Promise<boole
       });
 
     if (insertError) {
-      console.error("[consultation] insert failed:", insertError);
+      console.error("[consultation] insert failed:", insertError.message || insertError);
       return false;
     }
     return true;
@@ -66,143 +64,60 @@ async function tryPersistToSupabase(data: z.infer<typeof schema>): Promise<boole
   }
 }
 
-/** Minimal Gmail SMTP (AUTH LOGIN over TLS) — no extra dependency for Railway/bun. */
-async function sendViaGmail(opts: {
-  to: string;
-  from: string;
-  replyTo: string;
-  html: string;
-}): Promise<boolean> {
-  const user = process.env.GMAIL;
-  const pass = process.env.APP_PASSWORD?.replace(/\s+/g, "");
-  if (!user || !pass) return false;
+/**
+ * Railway blocks outbound Gmail SMTP (ETIMEDOUT on :465/:587).
+ * FormSubmit delivers over HTTPS to the inbox — first use needs one Confirm click in Gmail.
+ */
+async function sendViaFormSubmit(data: Lead, to: string): Promise<"ok" | "activate" | "fail"> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
 
-  const fromHeader = opts.from.includes("<") ? opts.from : `DigiGrey Website <${user}>`;
-  const message = [
-    `From: ${fromHeader}`,
-    `To: ${opts.to}`,
-    `Reply-To: ${opts.replyTo}`,
-    `Subject: ${SUBJECT}`,
-    "MIME-Version: 1.0",
-    'Content-Type: text/html; charset="UTF-8"',
-    "",
-    opts.html,
-  ].join("\r\n");
-
-  await smtpSend({
-    host: "smtp.gmail.com",
-    port: 465,
-    user,
-    pass,
-    mailFrom: user,
-    rcptTo: opts.to,
-    data: message,
-  });
-  return true;
-}
-
-function smtpSend(opts: {
-  host: string;
-  port: number;
-  user: string;
-  pass: string;
-  mailFrom: string;
-  rcptTo: string;
-  data: string;
-}): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const socket = tlsConnect(opts.port, opts.host, { servername: opts.host }, () => {
-      void run();
+  try {
+    const res = await fetch(`https://formsubmit.co/ajax/${encodeURIComponent(to)}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        name: data.name,
+        email: data.email,
+        phone: data.phone || "—",
+        service: data.service,
+        message: data.message || "—",
+        _subject: SUBJECT,
+        _template: "table",
+        _replyto: data.email,
+        _captcha: "false",
+      }),
     });
 
-    let buffer = "";
-    let settled = false;
-
-    const fail = (err: Error) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      reject(err);
+    const body = (await res.json().catch(() => ({}))) as {
+      success?: string | boolean;
+      message?: string;
+      error?: string;
     };
+    const text = `${body.message || ""} ${body.error || ""} ${body.success || ""}`.toLowerCase();
 
-    const ok = () => {
-      if (settled) return;
-      settled = true;
-      socket.end();
-      resolve();
-    };
-
-    socket.setEncoding("utf8");
-    socket.on("data", (chunk) => {
-      buffer += chunk;
-    });
-    socket.on("error", fail);
-    socket.on("timeout", () => fail(new Error("SMTP connection timed out")));
-    socket.setTimeout(20_000);
-
-    const readResponse = async (): Promise<{ code: number; lines: string }> => {
-      for (;;) {
-        const idx = buffer.indexOf("\r\n");
-        if (idx === -1) {
-          await new Promise<void>((r) => socket.once("data", () => r()));
-          continue;
+    if (!res.ok || body.error || text.includes("activate") || text.includes("confirm")) {
+      console.error("[consultation] FormSubmit response:", res.status, body);
+      if (text.includes("activate") || text.includes("confirm") || res.status === 200) {
+        // FormSubmit often returns 200 with activation instructions on first use
+        if (text.includes("activate") || text.includes("confirm") || text.includes("make sure")) {
+          return "activate";
         }
-        // multiline: "250-..." then final "250 "
-        const lines: string[] = [];
-        while (buffer.includes("\r\n")) {
-          const end = buffer.indexOf("\r\n");
-          const line = buffer.slice(0, end);
-          buffer = buffer.slice(end + 2);
-          lines.push(line);
-          if (/^\d{3} /.test(line)) break;
-        }
-        if (!lines.length) continue;
-        const last = lines[lines.length - 1]!;
-        const code = Number(last.slice(0, 3));
-        return { code, lines: lines.join("\n") };
       }
-    };
+      if (!res.ok || body.error) return "fail";
+    }
 
-    const write = (cmd: string) => {
-      socket.write(cmd + "\r\n");
-    };
-
-    const expect = async (min: number, max: number, step: string) => {
-      const res = await readResponse();
-      if (res.code < min || res.code > max) {
-        throw new Error(`SMTP ${step} failed (${res.code}): ${res.lines}`);
-      }
-      return res;
-    };
-
-    const run = async () => {
-      try {
-        await expect(200, 299, "banner");
-        write(`EHLO digigrey.ca`);
-        await expect(200, 299, "EHLO");
-        write("AUTH LOGIN");
-        await expect(300, 399, "AUTH LOGIN");
-        write(Buffer.from(opts.user).toString("base64"));
-        await expect(300, 399, "username");
-        write(Buffer.from(opts.pass).toString("base64"));
-        await expect(200, 299, "password");
-        write(`MAIL FROM:<${opts.mailFrom}>`);
-        await expect(200, 299, "MAIL FROM");
-        write(`RCPT TO:<${opts.rcptTo}>`);
-        await expect(200, 299, "RCPT TO");
-        write("DATA");
-        await expect(300, 399, "DATA");
-        // Dot-stuff lines that start with '.'
-        const stuffed = opts.data.replace(/^\./gm, "..");
-        socket.write(stuffed.replace(/\r?\n/g, "\r\n") + "\r\n.\r\n");
-        await expect(200, 299, "message body");
-        write("QUIT");
-        ok();
-      } catch (err) {
-        fail(err instanceof Error ? err : new Error(String(err)));
-      }
-    };
-  });
+    return "ok";
+  } catch (err) {
+    console.error("[consultation] FormSubmit failed:", err);
+    return "fail";
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function sendViaResend(opts: {
@@ -240,7 +155,6 @@ async function sendViaResend(opts: {
 export const submitConsultation = createServerFn({ method: "POST" })
   .validator((input: unknown) => schema.parse(input))
   .handler(async ({ data }) => {
-    // Bot sink: pretend success, do not persist or email
     if (data.website && data.website.trim().length > 0) {
       return { ok: true, emailed: false };
     }
@@ -252,44 +166,47 @@ export const submitConsultation = createServerFn({ method: "POST" })
       process.env.CONSULTATION_FROM_EMAIL ||
       (gmailUser ? `DigiGrey Website <${gmailUser}>` : "DigiGrey Website <onboarding@resend.dev>");
 
+    console.info("[consultation] lead:", {
+      name: data.name,
+      email: data.email,
+      phone: data.phone,
+      service: data.service,
+      to: TO_EMAIL,
+    });
+
     const saved = await tryPersistToSupabase(data);
     const html = buildHtml(data);
 
     let emailed = false;
+
+    // Prefer Resend (HTTPS) if configured
     try {
-      emailed = await sendViaGmail({
+      emailed = await sendViaResend({
         to: TO_EMAIL,
         from: FROM_EMAIL,
         replyTo: data.email,
         html,
       });
     } catch (err) {
-      console.error("[consultation] Gmail send failed:", err);
+      console.error("[consultation] Resend send failed:", err);
     }
 
+    // Fallback: FormSubmit HTTPS → GMAIL inbox (SMTP blocked on Railway)
     if (!emailed) {
-      try {
-        emailed = await sendViaResend({
-          to: TO_EMAIL,
-          from: FROM_EMAIL,
-          replyTo: data.email,
-          html,
-        });
-      } catch (err) {
-        console.error("[consultation] Resend send failed:", err);
+      const result = await sendViaFormSubmit(data, TO_EMAIL);
+      if (result === "activate") {
+        throw new Error(
+          `Check ${TO_EMAIL} for a FormSubmit activation email, click Confirm, then submit again.`,
+        );
       }
+      emailed = result === "ok";
     }
 
     if (!saved && !emailed) {
       throw new Error("We couldn't save your request. Please try again.");
     }
 
-    if (!emailed) {
-      console.warn("[consultation] Saved to DB but email was not sent.");
-      return { ok: true, emailed: false, warning: "Saved, but email delivery failed." };
-    }
-
-    return { ok: true, emailed: true, saved };
+    return { ok: true, emailed, saved };
   });
 
 function escapeHtml(s: string): string {
