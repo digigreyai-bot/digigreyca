@@ -14,7 +14,6 @@ const schema = z.object({
 });
 
 const SUBJECT = "New Consultation Request — DigiGrey Website";
-const SITE_ORIGIN = "https://www.digigrey.ca";
 
 type Lead = z.infer<typeof schema>;
 
@@ -65,57 +64,47 @@ async function tryPersistToSupabase(data: Lead): Promise<boolean> {
   }
 }
 
-/**
- * Railway blocks Gmail SMTP. FormSubmit works over HTTPS once the inbox
- * clicks the one-time "Activate Form" link.
- */
-async function sendViaFormSubmit(data: Lead, to: string): Promise<"ok" | "activate" | "fail"> {
+/** HTTPS webhook (Google Apps Script or Make.com) — works on Railway; SMTP does not. */
+async function sendViaWebhook(data: Lead, to: string, html: string): Promise<boolean> {
+  const url = process.env.CONSULTATION_WEBHOOK_URL;
+  if (!url) return false;
+
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
+  const timer = setTimeout(() => controller.abort(), 20_000);
 
   try {
-    const res = await fetch(`https://formsubmit.co/ajax/${encodeURIComponent(to)}`, {
+    const res = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        Origin: SITE_ORIGIN,
-        Referer: `${SITE_ORIGIN}/`,
-      },
+      headers: { "Content-Type": "application/json" },
       signal: controller.signal,
       body: JSON.stringify({
+        to,
+        subject: SUBJECT,
+        replyTo: data.email,
         name: data.name,
         email: data.email,
-        phone: data.phone || "—",
+        phone: data.phone || "",
         service: data.service,
-        message: data.message || "—",
-        _subject: SUBJECT,
-        _template: "table",
-        _replyto: data.email,
-        _captcha: "false",
+        message: data.message || "",
+        html,
       }),
     });
 
-    const body = (await res.json().catch(() => ({}))) as {
-      success?: string | boolean;
-      message?: string;
-      error?: string;
-    };
-    console.info("[consultation] FormSubmit:", res.status, body);
+    const text = await res.text();
+    console.info("[consultation] webhook:", res.status, text.slice(0, 300));
 
-    const success = body.success === true || body.success === "true";
-    const text = `${body.message || ""} ${body.error || ""}`.toLowerCase();
+    if (!res.ok) return false;
 
-    if (text.includes("activation") || text.includes("activate form") || text.includes("activate")) {
-      return "activate";
+    try {
+      const json = JSON.parse(text) as { ok?: boolean };
+      if (json.ok === false) return false;
+    } catch {
+      /* Make.com often returns empty/non-JSON — treat 2xx as success */
     }
-    if (!res.ok || body.error || body.success === false || body.success === "false") {
-      return "fail";
-    }
-    return success ? "ok" : "fail";
+    return true;
   } catch (err) {
-    console.error("[consultation] FormSubmit failed:", err);
-    return "fail";
+    console.error("[consultation] webhook failed:", err);
+    return false;
   } finally {
     clearTimeout(timer);
   }
@@ -181,27 +170,30 @@ export const submitConsultation = createServerFn({ method: "POST" })
     let emailed = false;
 
     try {
-      emailed = await sendViaResend({
-        to: TO_EMAIL,
-        from: FROM_EMAIL,
-        replyTo: data.email,
-        html,
-      });
+      emailed = await sendViaWebhook(data, TO_EMAIL, html);
     } catch (err) {
-      console.error("[consultation] Resend send failed:", err);
+      console.error("[consultation] webhook send failed:", err);
     }
 
     if (!emailed) {
-      const result = await sendViaFormSubmit(data, TO_EMAIL);
-      if (result === "activate") {
-        throw new Error(
-          `Open ${TO_EMAIL} → find FormSubmit "Activate Form" email → click the link → then submit again.`,
-        );
+      try {
+        emailed = await sendViaResend({
+          to: TO_EMAIL,
+          from: FROM_EMAIL,
+          replyTo: data.email,
+          html,
+        });
+      } catch (err) {
+        console.error("[consultation] Resend send failed:", err);
       }
-      emailed = result === "ok";
     }
 
     if (!saved && !emailed) {
+      if (!process.env.CONSULTATION_WEBHOOK_URL && !process.env.RESEND_API_KEY) {
+        throw new Error(
+          "Email not configured. Add CONSULTATION_WEBHOOK_URL on Railway (Google Apps Script — see scripts/consultation-mail.gs).",
+        );
+      }
       throw new Error("We couldn't save your request. Please try again.");
     }
 
