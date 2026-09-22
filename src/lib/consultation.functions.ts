@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { createClient } from "@supabase/supabase-js";
+import nodemailer from "nodemailer";
 import { z } from "zod";
 import type { Database } from "@/integrations/supabase/types";
 
@@ -15,50 +16,8 @@ const schema = z.object({
 
 const SUBJECT = "New Consultation Request — DigiGrey Website";
 
-export const submitConsultation = createServerFn({ method: "POST" })
-  .validator((input: unknown) => schema.parse(input))
-  .handler(async ({ data }) => {
-    // Bot sink: pretend success, do not persist or email
-    if (data.website && data.website.trim().length > 0) {
-      return { ok: true, emailed: false };
-    }
-
-    const SUPABASE_URL = process.env.SUPABASE_URL!;
-    const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY!;
-    const RESEND_API_KEY = process.env.RESEND_API_KEY;
-    const TO_EMAIL = process.env.CONSULTATION_TO_EMAIL || "info@digigrey.ca";
-    const FROM_EMAIL =
-      process.env.CONSULTATION_FROM_EMAIL || "DigiGrey Website <onboarding@resend.dev>";
-
-    // 1) Persist to database (backup) using publishable/anon client
-    const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
-      auth: { storage: undefined, persistSession: false, autoRefreshToken: false },
-    });
-
-    const insertPayload = {
-      name: data.name,
-      email: data.email,
-      phone: data.phone || null,
-      service: data.service,
-      message: data.message || null,
-    };
-
-    const { error: insertError } = await (supabase as any)
-      .from("consultation_submissions")
-      .insert(insertPayload);
-
-    if (insertError) {
-      console.error("[consultation] insert failed:", insertError);
-      throw new Error("We couldn't save your request. Please try again.");
-    }
-
-    // 2) Send email via Resend (only if key is configured)
-    if (!RESEND_API_KEY) {
-      console.warn("[consultation] RESEND_API_KEY not set — submission stored but email not sent.");
-      return { ok: true, emailed: false };
-    }
-
-    const html = `
+function buildHtml(data: z.infer<typeof schema>): string {
+  return `
       <div style="font-family:Manrope,Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#1a1a1a">
         <h2 style="color:#4A0E6E;margin:0 0 16px">New Consultation Request</h2>
         <p style="color:#555;margin:0 0 24px">A new lead just came in via the DigiGrey website.</p>
@@ -71,29 +30,152 @@ export const submitConsultation = createServerFn({ method: "POST" })
         </table>
       </div>
     `;
+}
 
-    const res = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${RESEND_API_KEY}`,
-      },
-      body: JSON.stringify({
-        from: FROM_EMAIL,
-        to: [TO_EMAIL],
-        reply_to: data.email,
-        subject: SUBJECT,
-        html,
-      }),
+async function tryPersistToSupabase(data: z.infer<typeof schema>): Promise<boolean> {
+  const SUPABASE_URL = process.env.SUPABASE_URL;
+  const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
+  if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
+    console.warn("[consultation] Supabase env not set — skipping DB save.");
+    return false;
+  }
+
+  try {
+    const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+      auth: { storage: undefined, persistSession: false, autoRefreshToken: false },
     });
 
-    if (!res.ok) {
-      const body = await res.text();
-      console.error(`[consultation] Resend send failed [${res.status}]: ${body}`);
+    const { error: insertError } = await (supabase as any)
+      .from("consultation_submissions")
+      .insert({
+        name: data.name,
+        email: data.email,
+        phone: data.phone || null,
+        service: data.service,
+        message: data.message || null,
+      });
+
+    if (insertError) {
+      console.error("[consultation] insert failed:", insertError);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error("[consultation] insert threw:", err);
+    return false;
+  }
+}
+
+async function sendViaGmail(opts: {
+  to: string;
+  from: string;
+  replyTo: string;
+  html: string;
+}): Promise<boolean> {
+  const user = process.env.GMAIL;
+  const pass = process.env.APP_PASSWORD?.replace(/\s+/g, "");
+  if (!user || !pass) return false;
+
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: { user, pass },
+  });
+
+  await transporter.sendMail({
+    from: opts.from,
+    to: opts.to,
+    replyTo: opts.replyTo,
+    subject: SUBJECT,
+    html: opts.html,
+  });
+  return true;
+}
+
+async function sendViaResend(opts: {
+  to: string;
+  from: string;
+  replyTo: string;
+  html: string;
+}): Promise<boolean> {
+  const RESEND_API_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_API_KEY) return false;
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+    },
+    body: JSON.stringify({
+      from: opts.from,
+      to: [opts.to],
+      reply_to: opts.replyTo,
+      subject: SUBJECT,
+      html: opts.html,
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    console.error(`[consultation] Resend send failed [${res.status}]: ${body}`);
+    return false;
+  }
+  return true;
+}
+
+export const submitConsultation = createServerFn({ method: "POST" })
+  .validator((input: unknown) => schema.parse(input))
+  .handler(async ({ data }) => {
+    // Bot sink: pretend success, do not persist or email
+    if (data.website && data.website.trim().length > 0) {
+      return { ok: true, emailed: false };
+    }
+
+    const gmailUser = process.env.GMAIL;
+    const TO_EMAIL =
+      process.env.CONSULTATION_TO_EMAIL || gmailUser || "info@digigrey.ca";
+    const FROM_EMAIL =
+      process.env.CONSULTATION_FROM_EMAIL ||
+      (gmailUser ? `DigiGrey Website <${gmailUser}>` : "DigiGrey Website <onboarding@resend.dev>");
+
+    const saved = await tryPersistToSupabase(data);
+    const html = buildHtml(data);
+
+    let emailed = false;
+    try {
+      emailed = await sendViaGmail({
+        to: TO_EMAIL,
+        from: FROM_EMAIL,
+        replyTo: data.email,
+        html,
+      });
+    } catch (err) {
+      console.error("[consultation] Gmail send failed:", err);
+    }
+
+    if (!emailed) {
+      try {
+        emailed = await sendViaResend({
+          to: TO_EMAIL,
+          from: FROM_EMAIL,
+          replyTo: data.email,
+          html,
+        });
+      } catch (err) {
+        console.error("[consultation] Resend send failed:", err);
+      }
+    }
+
+    if (!saved && !emailed) {
+      throw new Error("We couldn't save your request. Please try again.");
+    }
+
+    if (!emailed) {
+      console.warn("[consultation] Saved to DB but email was not sent.");
       return { ok: true, emailed: false, warning: "Saved, but email delivery failed." };
     }
 
-    return { ok: true, emailed: true };
+    return { ok: true, emailed: true, saved };
   });
 
 function escapeHtml(s: string): string {
